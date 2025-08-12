@@ -47,6 +47,7 @@
     <Compile Include="Models\TaskAssignment.cs" />
     <Compile Include="Models\TaxiVehicle.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="SimulationConfig.cs" />
   </ItemGroup>
   <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />

@@ -5,6 +5,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
+using System.IO;
+using System.Runtime.Serialization.Formatters.Binary;
+using SharedClasses.Models;
 
 namespace DispatchServer
 {
@@ -24,6 +27,9 @@ namespace DispatchServer
 
         //Evidencije
         private static readonly List<Socket> _vehicleSockets = new List<Socket>();
+        private static readonly Dictionary<int, TaxiVehicle> _activeVehicles = new Dictionary<int, TaxiVehicle>();
+        private static readonly Dictionary<int, Socket> _socketByVehicleId = new Dictionary<int, Socket>();
+
         static void Main(string[] args)
         {
             Console.Title = "DispatchServer";
@@ -104,13 +110,43 @@ namespace DispatchServer
                                 if(read <= 0)
                                 {
                                     Console.WriteLine($"[Server] Vehicle disconnected: {sock.RemoteEndPoint}");
+                                    var kv = _socketByVehicleId.FirstOrDefault(p => p.Value == sock);
+                                    if (kv.Key != 0)
+                                    {
+                                        _socketByVehicleId.Remove(kv.Key);
+                                        _activeVehicles.Remove(kv.Key);
+                                    }
                                     _vehicleSockets.Remove(sock);
                                     sock.Close();
                                     PrintStatus();
                                     continue;
                                 }
-                                string msg = Encoding.UTF8.GetString(_bufVehicle, 0, read);
-                                Console.WriteLine($"[Server] TCP from {sock.RemoteEndPoint}: {msg}");
+                                try
+                                {
+                                    object obj;
+                                    using (var ms = new MemoryStream(_bufVehicle, 0, read)) // C# 7.3 friendly
+                                    {
+                                        var bf = new BinaryFormatter();
+                                        obj = bf.Deserialize(ms);
+                                    }
+
+                                    if (obj is TaxiVehicle tv)
+                                    {
+                                        _activeVehicles[tv.Id] = tv;    // čuvamo najnovije stanje vozila
+                                        _socketByVehicleId[tv.Id] = sock;  // map: ID → socket
+
+                                        Console.WriteLine($"[Server] Vehicle {tv.Id} @ ({tv.Position.X},{tv.Position.Y}) {tv.Status}");
+                                        PrintStatus();
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("[Server] Unknown object received from vehicle.");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine("[Server] Deserialize error: " + ex.Message);
+                                }
                             }
                             catch (SocketException)
                             {
@@ -135,7 +171,9 @@ namespace DispatchServer
         {
             Console.WriteLine();
             Console.WriteLine("=== TAXI DISPATCH ===");
-            Console.WriteLine($"Vehicles connected: {_vehicleSockets.Count}");
+            Console.WriteLine($"Vehicles connected (sockets): {_vehicleSockets.Count}");
+            foreach (var v in _activeVehicles.Values.OrderBy(v => v.Id))
+                Console.WriteLine($" - ID {v.Id}: {v.Status} @ ({v.Position.X},{v.Position.Y})");
             Console.WriteLine();
         }
     }
