@@ -110,14 +110,21 @@ namespace DispatchServer
                                 if(read <= 0)
                                 {
                                     Console.WriteLine($"[Server] Vehicle disconnected: {sock.RemoteEndPoint}");
-                                    var kv = _socketByVehicleId.FirstOrDefault(p => p.Value == sock);
-                                    if (kv.Key != 0)
+                                    // uklanjanje iz evidencija 
+                                    int removeId = -1;
+                                    foreach (var kv in _socketByVehicleId)
                                     {
-                                        _socketByVehicleId.Remove(kv.Key);
-                                        _activeVehicles.Remove(kv.Key);
+                                        if (kv.Value == sock) { removeId = kv.Key; break; }
                                     }
+                                    if (removeId != -1)
+                                    {
+                                        _socketByVehicleId.Remove(removeId);
+                                        _activeVehicles.Remove(removeId);
+                                    }
+
                                     _vehicleSockets.Remove(sock);
-                                    sock.Close();
+                                    try { sock.Close(); } catch { }
+
                                     PrintStatus();
                                     continue;
                                 }
@@ -150,9 +157,21 @@ namespace DispatchServer
                             }
                             catch (SocketException)
                             {
-                                //force close
+                                // uklanjanje iz evidencija 
+                                int removeId = -1;
+                                foreach (var kv in _socketByVehicleId)
+                                {
+                                    if (kv.Value == sock) { removeId = kv.Key; break; }
+                                }
+                                if (removeId != -1)
+                                {
+                                    _socketByVehicleId.Remove(removeId);
+                                    _activeVehicles.Remove(removeId);
+                                }
+
                                 _vehicleSockets.Remove(sock);
                                 try { sock.Close(); } catch { }
+
                                 Console.WriteLine("[Server] Vehicle closed (exception).");
                                 PrintStatus();
                             }
