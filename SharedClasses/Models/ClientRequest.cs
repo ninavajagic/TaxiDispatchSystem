@@ -10,8 +10,9 @@ namespace SharedClasses.Models
 
     public class ClientRequest
     {
-        public Coordinate Start { get; set; } = new Coordinate(); //koordinate polazne lokacije klijenta
-        public Coordinate Destination { get; set; } = new Coordinate(); //koordinate odredi[ta klijenta
+        public int ClientId { get; set; } // ID klijenta
+        public Coordinate From { get; set; } = new Coordinate(); // početna lokacija
+        public Coordinate To { get; set; } = new Coordinate(); // odredište
 
     }
 }

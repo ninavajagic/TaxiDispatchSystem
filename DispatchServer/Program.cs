@@ -84,21 +84,41 @@ namespace DispatchServer
                         }
                         else if (sock == _serverUdp)
                         {
-                            //Klijent salje 
                             try
                             {
                                 EndPoint clientEp = new IPEndPoint(IPAddress.Any, 0);
                                 int read = _serverUdp.ReceiveFrom(_bufClient, ref clientEp);
-                                string msg = Encoding.UTF8.GetString(_bufClient, 0, read);
-                                Console.WriteLine($"[Server] UDP from {clientEp}: {msg}");
 
-                                //Minimalni odgovor
-                                var reply = Encoding.UTF8.GetBytes("ACK");
+                                object obj;
+                                using (var ms = new MemoryStream(_bufClient, 0, read))
+                                {
+                                    var bf = new BinaryFormatter();
+                                    obj = bf.Deserialize(ms);
+                                }
+
+                                string replyText = "ACK";
+                                if (obj is ClientRequest cr)
+                                {
+                                    Console.WriteLine($"[Server] UDP ClientRequest #{cr.ClientId}: from ({cr.From.X},{cr.From.Y}) to ({cr.To.X},{cr.To.Y})");
+                                    replyText = "REQUEST RECEIVED";
+                                    // Sledeći korak: naći nearest vehicle + poslati TaskAssignment (TCP) + ETA klijentu
+                                }
+                                else
+                                {
+                                    var txt = Encoding.UTF8.GetString(_bufClient, 0, read);
+                                    Console.WriteLine($"[Server] UDP (text) from {clientEp}: {txt}");
+                                }
+
+                                var reply = Encoding.UTF8.GetBytes(replyText);
                                 _serverUdp.SendTo(reply, clientEp);
                             }
                             catch (SocketException ex)
                             {
-                                Console.WriteLine("[Server] UDP recv error: " + ex.Message);
+                                Console.WriteLine("[Server] UDP receive error: " + ex.Message);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("[Server] UDP deserialize error: " + ex.Message);
                             }
                         }
                         else
