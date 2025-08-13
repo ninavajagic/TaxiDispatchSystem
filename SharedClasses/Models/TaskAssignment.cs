@@ -12,6 +12,7 @@ namespace SharedClasses.Models
     {
         public int VehicleId { get; set; }  // ID vozila kome je dodeljen zadatak
         public ClientRequest Request { get; set; } = new ClientRequest(); // Zahtev klijenta koji se dodeljuje vozilu
+        public int EstimatedSteps { get; set; }                  // Chebyshev koraci vozilo→klijent (za ETA/cenu)
 
 
     }
