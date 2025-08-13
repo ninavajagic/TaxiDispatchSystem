@@ -10,5 +10,6 @@ namespace SharedClasses
     public static class SimulationConfig
     {
         public const int GridSize = 20; // mreža 20x20 → validne koordinate su 0..29
+        public const decimal PricePerKm = 80m; // obavezno decimal (m)
     }
 }

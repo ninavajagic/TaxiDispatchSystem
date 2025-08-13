@@ -16,7 +16,14 @@ namespace TaxiVehicleApp
 {
     class Program
     {
+        private const string ServerHost = "127.0.0.1";
         private const int ServerPort = 50000;
+
+        // Chebyshev distanca na mreži (max|dx|,|dy|) – ista metrika koju koristi server
+        private static int Chebyshev(Coordinate a, Coordinate b)
+        {
+            return Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
+        }
 
         static void Main(string[] args)
         {
@@ -30,12 +37,13 @@ namespace TaxiVehicleApp
                 Console.WriteLine("ERROR: Vehicle ID must be a non-negative integer. Please try again.");
             }
 
-            // random start 0..19 (20x20)
+            // Nasumična početna lokacija u opsegu 0..GridSize-1 (za 20×20 → 0..19)
             var rnd = new Random();
             var start = new Coordinate(
                 rnd.Next(0, SimulationConfig.GridSize),
                 rnd.Next(0, SimulationConfig.GridSize));
 
+            // Inicijalno stanje vozila – slobodno na start poziciji
             var vehicle = new TaxiVehicle
             {
                 Id = id,
@@ -43,157 +51,152 @@ namespace TaxiVehicleApp
                 Status = RideStatus.Available
             };
 
-            var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            var serverEP = new IPEndPoint(IPAddress.Loopback, ServerPort);
+            try
+            {
+                using (var client = new TcpClient())
+                {
+                    client.Connect(ServerHost, ServerPort);
+                    var stream = client.GetStream();
+                    Console.WriteLine($"[Vehicle {id}] Connected to server {ServerHost}:{ServerPort}");
 
-            try 
-            { 
-                clientSocket.Connect(serverEP); 
+                    // Pošalji početni snapshot vozila serveru (BinaryFormatter)
+                    SendVehicle(stream, vehicle);
+
+                    Console.WriteLine($"[Vehicle {id}] Ready at ({start.X},{start.Y}). Waiting for assignments...");
+
+                    // Petlja prijema zadataka od servera
+                    var buf = new byte[1024];
+                    while (true)
+                    {
+                        int read;
+                        try
+                        {
+                            // Blokirajuće čitanje; 
+                            read = stream.Read(buf, 0, buf.Length);
+                        }
+                        catch (IOException)
+                        {
+                            // timeout ili IO greška – pokušaj nastaviti
+                            continue;
+                        }
+
+                        if (read <= 0)
+                        {
+                            Console.WriteLine("[Vehicle] Server closed the connection.");
+                            break;
+                        }
+
+                        object obj;
+                        try
+                        {
+                            using (var ms = new MemoryStream(buf, 0, read))
+                            {
+                                var bf = new BinaryFormatter();
+                                obj = bf.Deserialize(ms);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("[Vehicle] Deserialize error: " + ex.Message);
+                            continue;
+                        }
+
+                        if (obj is TaskAssignment ta)
+                        {
+                            Console.WriteLine($"[Vehicle {id}] Assignment -> Client {ta.Request.ClientId} " +
+                                              $"from ({ta.Request.From.X},{ta.Request.From.Y}) to ({ta.Request.To.X},{ta.Request.To.Y})");
+
+                            // 1) Kretanje do klijenta
+                            vehicle.Status = RideStatus.GoingToPickup; // odlazak na lokaciju klijenta
+                            SendVehicle(stream, vehicle);
+                            SimulateMovement(vehicle, ta.Request.From, stream);
+
+                            // 2) Prevoz klijenta do odredišta
+                            vehicle.Status = RideStatus.InRide; // u vožnji sa klijentom
+                            SendVehicle(stream, vehicle);
+                            SimulateMovement(vehicle, ta.Request.To, stream);
+
+                            // 3) Povratak u Available i slanje završnog statusa
+                            vehicle.Status = RideStatus.Available; // vozilo je opet slobodno
+                            SendVehicle(stream, vehicle);
+
+                            // >>> OPCIJA B: km i cena računamo od KLIJENT → ODREDIŠTE (ne vozilo → klijent)
+                            int rideKm = Chebyshev(ta.Request.From, ta.Request.To);
+                            decimal fare = rideKm * SimulationConfig.PricePerKm;
+
+                            var status = new RideStatusUpdate
+                            {
+                                VehicleId = id,
+                                ClientId = ta.Request.ClientId,
+                                Km = rideKm,
+                                Fare = fare
+                            };
+
+                            using (var ms2 = new MemoryStream())
+                            {
+                                var bf2 = new BinaryFormatter();
+                                bf2.Serialize(ms2, status);
+                                var payload2 = ms2.ToArray();
+                                stream.Write(payload2, 0, payload2.Length);
+                                stream.Flush();
+                            }
+
+                            Console.WriteLine($"[Vehicle {id}] Ride finished. Km={rideKm}, Fare={fare} RSD");
+                            Console.WriteLine($"[Vehicle {id}] Waiting for next assignment...");
+                        }
+                        else
+                        {
+                            Console.WriteLine("[Vehicle] Unknown object received from server.");
+                        }
+                    }
+
+                    Console.WriteLine("[Vehicle] Press ENTER to exit...");
+                    Console.ReadLine();
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"ERROR: cannot connect to server: {ex.Message}");
+                Console.WriteLine("ERROR: Unable to connect/send to server. Details: " + ex.Message);
+                Console.WriteLine("Press ENTER to exit...");
                 Console.ReadLine();
-                return;
-            }
-
-            // 1) Pošalji početni snapshot 
-            SendVehicle(clientSocket, vehicle);
-
-            Console.Clear();
-            Console.WriteLine($"VEHICLE {id} connected. Position: ({start.X},{start.Y})");
-            Console.WriteLine("Waiting for assignments... (Ctrl+C to exit)");
-
-            var recvBuf = new byte[1024];
-
-            while (true)
-            {
-                int read;
-                try
-                {
-                    read = clientSocket.Receive(recvBuf); // blocking čekanje zadatka
-                    if (read <= 0) 
-                    { 
-                        Console.WriteLine("[Vehicle] Server closed."); 
-                        break; 
-                    }
-                }
-                catch (SocketException ex)
-                {
-                    Console.WriteLine($"[Vehicle] Receive error: {ex.Message}");
-                    break;
-                }
-
-                object obj = null;
-                try
-                {
-                    using (var ms = new MemoryStream(recvBuf, 0, read))
-                    {
-                        var bf = new BinaryFormatter();
-                        obj = bf.Deserialize(ms);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("[Vehicle] Deserialize error: " + ex.Message);
-                    continue;
-                }
-
-                if (obj is TaskAssignment ta)
-                {
-                    Console.WriteLine($"[Vehicle {id}] Assignment -> Client {ta.Request.ClientId} " +
-                                      $"from ({ta.Request.From.X},{ta.Request.From.Y}) " +
-                                      $"to ({ta.Request.To.X},{ta.Request.To.Y})");
-
-                    // 2) Do klijenta
-                    vehicle.Status = RideStatus.GoingToPickup; 
-                    SimulateMove(clientSocket, vehicle, ta.Request.From);
-
-                    // 3) Do odredišta
-                    vehicle.Status = RideStatus.InRide; 
-                    SendVehicle(clientSocket, vehicle);
-                    SimulateMove(clientSocket, vehicle, ta.Request.To);
-
-                    // 4) Završetak – ponovo slobodan i pošalji status vožnje
-                    vehicle.Status = RideStatus.Available;
-                    SendVehicle(clientSocket, vehicle);
-
-                    var status = new RideStatusUpdate
-                    {
-                        ClientId = ta.Request.ClientId,
-                        VehicleId = vehicle.Id,
-                        Km = ta.EstimatedSteps,       // koristimo procenu sa servera)
-                        Fare = ta.EstimatedSteps * 80m // 80 RSD po "km"  80m = decimal literal
-                    };
-                    SendRideStatus(clientSocket, status);
-
-                    Console.WriteLine($"[Vehicle {id}] Ride finished. Fare: {status.Fare:0} RSD");
-                }
-                else
-                {
-                    Console.WriteLine("[Vehicle] Unknown object received.");
-                }
-            }
-
-            try { clientSocket.Close(); } catch { }
-            Console.WriteLine("Vehicle shutting down. Press ENTER to exit...");
-            Console.ReadLine();
-        }
-
-        // === helpers ===
-
-        // pomeri po 1 korak po osi X i/ili Y; posle svakog koraka šalje snapshot serveru
-        private static void SimulateMove(Socket sock, TaxiVehicle v, Coordinate target)
-        {
-            while (v.Position.X != target.X || v.Position.Y != target.Y)
-            {
-                if (v.Position.X < target.X) v.Position.X++;
-                else if (v.Position.X > target.X) v.Position.X--;
-                if (v.Position.Y < target.Y) v.Position.Y++;
-                else if (v.Position.Y > target.Y) v.Position.Y--;
-
-                SendVehicle(sock, v);       // update servera (pozicija + status)
-                Thread.Sleep(800);          // 0.8 s po koraku
             }
         }
 
-        private static void SendVehicle(Socket sock, TaxiVehicle v)
+        // Šalje trenutno stanje vozila serveru (binarna serijalizacija)
+        private static void SendVehicle(NetworkStream stream, TaxiVehicle vehicle)
         {
             try
             {
-                byte[] buffer;
                 using (var ms = new MemoryStream())
                 {
                     var bf = new BinaryFormatter();
-                    bf.Serialize(ms, v);
-                    buffer = ms.ToArray();
+                    bf.Serialize(ms, vehicle);
+                    var bytes = ms.ToArray();
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush();
                 }
-                sock.Send(buffer);
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[Vehicle] Send vehicle error: " + ex.Message);
+                Console.WriteLine("[Vehicle] Send error: " + ex.Message);
             }
         }
 
-        private static void SendRideStatus(Socket sock, RideStatusUpdate s)
+        // Simulira kretanje vozila do cilja; posle svakog koraka šalje stanje serveru
+        private static void SimulateMovement(TaxiVehicle vehicle, Coordinate target, NetworkStream stream)
         {
-            try
+            // Pomera se po 1 u X i/ili Y (kao u referentnom kodu); pauza 0.8s po koraku
+            while (vehicle.Position.X != target.X || vehicle.Position.Y != target.Y)
             {
-                byte[] buffer;
-                using (var ms = new MemoryStream())
-                {
-                    var bf = new BinaryFormatter();
-                    bf.Serialize(ms, s);
-                    buffer = ms.ToArray();
-                }
-                sock.Send(buffer);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("[Vehicle] Send status error: " + ex.Message);
+                if (vehicle.Position.X < target.X) vehicle.Position.X++;
+                else if (vehicle.Position.X > target.X) vehicle.Position.X--;
+
+                if (vehicle.Position.Y < target.Y) vehicle.Position.Y++;
+                else if (vehicle.Position.Y > target.Y) vehicle.Position.Y--;
+
+                SendVehicle(stream, vehicle);
+                Thread.Sleep(800); // da se kretanje “vidi”
             }
         }
-
     }
 }
