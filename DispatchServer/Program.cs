@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using System.IO;
 using System.Runtime.Serialization.Formatters.Binary;
 using SharedClasses.Models;
+using SharedClasses.Enums;
 
 namespace DispatchServer
 {
@@ -96,15 +97,56 @@ namespace DispatchServer
                                     obj = bf.Deserialize(ms);
                                 }
 
-                                string replyText = "ACK";
+                                string replyText = "REQUEST RECEIVED";
                                 if (obj is ClientRequest cr)
                                 {
                                     Console.WriteLine($"[Server] UDP ClientRequest #{cr.ClientId}: from ({cr.From.X},{cr.From.Y}) to ({cr.To.X},{cr.To.Y})");
-                                    replyText = "REQUEST RECEIVED";
-                                    // Sledeći korak: naći nearest vehicle + poslati TaskAssignment (TCP) + ETA klijentu
+
+                                    // 1) nađi najbliže Available vozilo
+                                    var nearest = FindNearestAvailable(cr.From);
+                                    if (nearest == null)
+                                    {
+                                        replyText = "No available vehicles at the moment";
+                                    }
+                                    else
+                                    {
+                                        // 2) pošalji TaskAssignment tom vozilu preko njegovog TCP socketa
+                                        var ta = new TaskAssignment { VehicleId = nearest.Id, Request = cr };
+
+                                        byte[] payload;
+                                        using (var ms = new MemoryStream())
+                                        {
+                                            var bf = new BinaryFormatter();
+                                            bf.Serialize(ms, ta);
+                                            payload = ms.ToArray();
+                                        }
+
+                                        Socket vehSock;
+                                        if (_socketByVehicleId.TryGetValue(nearest.Id, out vehSock))
+                                        {
+                                            try
+                                            {
+                                                vehSock.Send(payload);
+                                                // 3) izračunaj ETA (broj Chebyshev koraka / brzina 0.8 koraka u sekundi)
+                                                int steps = Chebyshev(nearest.Position, cr.From);
+                                                double etaSec = steps / 0.8;
+                                                replyText = $"Vehicle {nearest.Id} assigned. ETA ≈ {etaSec:0}s";
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Console.WriteLine("[Server] Error sending TaskAssignment: " + ex.Message);
+                                                replyText = "Error assigning vehicle";
+                                            }
+                                        }
+                                        else
+                                        {
+                                            replyText = "Vehicle socket not found";
+                                        }
+                                    }
                                 }
                                 else
                                 {
+                                    // fallback kada stigne čist tekst
                                     var txt = Encoding.UTF8.GetString(_bufClient, 0, read);
                                     Console.WriteLine($"[Server] UDP (text) from {clientEp}: {txt}");
                                 }
@@ -118,9 +160,10 @@ namespace DispatchServer
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine("[Server] UDP deserialize error: " + ex.Message);
+                                Console.WriteLine("[Server] UDP deserialize/handle error: " + ex.Message);
                             }
                         }
+
                         else
                         {
                             //Poruka od povezanog vozila (TCP)
@@ -151,7 +194,7 @@ namespace DispatchServer
                                 try
                                 {
                                     object obj;
-                                    using (var ms = new MemoryStream(_bufVehicle, 0, read)) // C# 7.3 friendly
+                                    using (var ms = new MemoryStream(_bufVehicle, 0, read)) 
                                     {
                                         var bf = new BinaryFormatter();
                                         obj = bf.Deserialize(ms);
@@ -215,5 +258,42 @@ namespace DispatchServer
                 Console.WriteLine($" - ID {v.Id}: {v.Status} @ ({v.Position.X},{v.Position.Y})");
             Console.WriteLine();
         }
+
+        // Euklidsko rastojanje za izbor najbližeg 
+        private static double Euclidean(Coordinate a, Coordinate b)
+        {
+            double dx = a.X - b.X;
+            double dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        // Chebyshev rastojanje (koliko "koraka" do tačke) – za ETA
+        private static int Chebyshev(Coordinate a, Coordinate b)
+        {
+            return Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
+        }
+
+        // Pronađi najbliže vozilo koje je Available
+        private static TaxiVehicle FindNearestAvailable(Coordinate from)
+        {
+            TaxiVehicle best = null;
+            double bestDist = double.MaxValue;
+            foreach (var v in _activeVehicles.Values)
+            {
+                if (v.Status == SharedClasses.Enums.RideStatus.Available)
+                {
+                    double d = Euclidean(v.Position, from);
+                    if (d < bestDist)
+                    {
+                        bestDist = d;
+                        best = v;
+                    }
+                }
+            }
+            return best;
+        }
+
+
+
     }
 }

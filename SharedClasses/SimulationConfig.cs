@@ -9,6 +9,6 @@ namespace SharedClasses
     // Globalna podešavanja simulacije (koriste i server i vozilo)
     public static class SimulationConfig
     {
-        public const int GridSize = 30; // mreža 30x30 → validne koordinate su 0..29
+        public const int GridSize = 20; // mreža 20x20 → validne koordinate su 0..29
     }
 }
