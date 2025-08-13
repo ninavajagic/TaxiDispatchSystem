@@ -16,37 +16,39 @@ namespace ClientApp
     {
         private const string ServerHost = "127.0.0.1";
         private const int ServerUdpPort = 50001;
+
         static void Main(string[] args)
         {
             Console.Title = "ClientApp";
             Console.Write("Enter Client ID: ");
             int clientId;
-            while(true)
-            {
-                var input = Console.ReadLine();
-                if (int.TryParse(input, out clientId) && clientId >= 0) break;
-                Console.WriteLine("ERROR: Client ID must be a non-negative integer. Please try again.");
-            }
-            int max = SimulationConfig.GridSize - 1;
-            Console.Write($"Enter start X (0..{max}): "); int sx = ReadIntInRange(0, max);
-            Console.Write($"Enter start Y (0..{max}): "); int sy = ReadIntInRange(0, max);
-            Console.Write($"Enter dest  X (0..{max}): "); int dx = ReadIntInRange(0, max);
-            Console.Write($"Enter dest  Y (0..{max}): "); int dy = ReadIntInRange(0, max);
+            while (!int.TryParse(Console.ReadLine(), out clientId) || clientId < 0)
+                Console.Write("ERROR: enter non-negative integer: ");
+
+            Console.Write("From X (0..19): ");
+            int fx = ReadCoord();
+            Console.Write("From Y (0..19): ");
+            int fy = ReadCoord();
+
+            Console.Write("To   X (0..19): ");
+            int tx = ReadCoord();
+            Console.Write("To   Y (0..19): ");
+            int ty = ReadCoord();
 
             var req = new ClientRequest
             {
                 ClientId = clientId,
-                From = new Coordinate(sx, sy),
-                To = new Coordinate(dx, dy)
+                From = new Coordinate(fx, fy),
+                To = new Coordinate(tx, ty)
             };
 
             try
             {
-                using (var udp = new UdpClient())
+                using (var udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
                 {
-                    var serverEP = new IPEndPoint(IPAddress.Parse(ServerHost), ServerUdpPort);
+                    var serverEp = new IPEndPoint(IPAddress.Parse(ServerHost), ServerUdpPort);
 
-                    // binarna serijalizacija zahteva (isti princip kao u njihovom projektu)
+                    // Pošalji binarno
                     byte[] payload;
                     using (var ms = new MemoryStream())
                     {
@@ -54,37 +56,54 @@ namespace ClientApp
                         bf.Serialize(ms, req);
                         payload = ms.ToArray();
                     }
+                    udp.SendTo(payload, serverEp);
+                    Console.WriteLine("[Client] Request sent.");
 
-                    udp.Send(payload, payload.Length, serverEP);
-                    udp.Client.ReceiveTimeout = 3000; // 3s
+                    // Slušaj poruke servera
+                    EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+                    var buf = new byte[1024];
 
-                    IPEndPoint remote = null;
-                    var resp = udp.Receive(ref remote);
-                    Console.WriteLine("[Client] Server replied: " + Encoding.UTF8.GetString(resp));
+                    Console.WriteLine("[Client] Waiting for server updates (ETA/approaching/arrival)...");
+                    udp.ReceiveTimeout = 30000; // 30s po poruci
+
+                    while (true)
+                    {
+                        try
+                        {
+                            int read = udp.ReceiveFrom(buf, ref any);
+                            var msg = Encoding.UTF8.GetString(buf, 0, read);
+                            Console.WriteLine("[Server → Client] " + msg);
+
+                            if (msg.StartsWith("Arrived at destination!", StringComparison.OrdinalIgnoreCase))
+                            {
+                                break; // vožnja gotova
+                            }
+                        }
+                        catch (SocketException)
+                        {
+                            // timeout – izađi ili nastavi; ovde izlazimo
+                            Console.WriteLine("[Client] No more updates (timeout).");
+                            break;
+                        }
+                    }
+
+                    Console.WriteLine("Press ENTER to exit...");
+                    Console.ReadLine();
                 }
-            }
-            catch (SocketException ex)
-            {
-                Console.WriteLine("ERROR: UDP send/receive failed: " + ex.Message);
             }
             catch (Exception ex)
             {
                 Console.WriteLine("ERROR: " + ex.Message);
+                Console.ReadLine();
             }
-
-            Console.WriteLine("Press ENTER to exit...");
-            Console.ReadLine();
-
         }
-        private static int ReadIntInRange(int min, int max)
+
+        private static int ReadCoord()
         {
-            while (true)
-            {
-                var s = Console.ReadLine();
-                int v;
-                if (int.TryParse(s, out v) && v >= min && v <= max) return v;
-                Console.WriteLine($"ERROR: Enter an integer in range [{min}..{max}]. Try again:");
-            }
+            int c;
+            while (!int.TryParse(Console.ReadLine(), out c) || c < 0 || c >= 20)
+                Console.Write("ERROR: enter 0..19: ");
+            return c;
         }
     }
 }
