@@ -44,6 +44,8 @@ namespace DispatchServer
         private static readonly Dictionary<int, EndPoint> _clientEpByClientId = new Dictionary<int, EndPoint>(); // klijent -> njegov UDP EP
         private static readonly Dictionary<int, int> _clientIdByVehicleId = new Dictionary<int, int>(); // vozilo -> klijent
 
+        private static readonly Dictionary<int, TaskAssignment> _lastAssignmentByVehicle = new Dictionary<int, TaskAssignment>();
+
         static void Main(string[] args)
         {
             Console.Title = "DispatchServer";
@@ -138,9 +140,11 @@ namespace DispatchServer
                                             var bf2 = new BinaryFormatter();
                                             bf2.Serialize(ms2, ta);
                                             var payload = ms2.ToArray();
-                                            vSock.Send(payload);
+                                            vSock.Send(payload);                                        
                                             Console.WriteLine($"[Server] TaskAssignment sent to vehicle {best.Id} ({payload.Length} bytes) for client {cr.ClientId}");
                                         }
+
+                                        _lastAssignmentByVehicle[best.Id] = ta;   // čuvamo poslednji dodeljeni zadatak tom vozilu
 
                                         // upiši evidencije
                                         _taskByVehicleId[best.Id] = ta;
@@ -323,6 +327,7 @@ namespace DispatchServer
                     _clientIdByVehicleId.Remove(removeId);
                     _stepCounterByVehicleId.Remove(removeId);
                 }
+                _lastAssignmentByVehicle.Remove(removeId);
 
                 _socketByVehicleId.Remove(removeId);
                 _activeVehicles.Remove(removeId);
@@ -374,6 +379,24 @@ namespace DispatchServer
             foreach (var v in _activeVehicles.Values.OrderBy(v => v.Id))
             {
                 Console.WriteLine($" - ID {v.Id}: {v.Status} @ ({v.Position.X},{v.Position.Y})  Km={v.Kilometers}  Earn={v.Earnings}  Psg={v.PassengersServed}");
+            }
+            Console.WriteLine();
+
+            // ACTIVE TASKS
+            if (_taskByVehicleId.Count == 0)
+            {
+                Console.WriteLine("Active tasks: none");
+            }
+            else
+            {
+                Console.WriteLine("Active tasks:");
+                foreach (var kv in _taskByVehicleId.OrderBy(k => k.Key))
+                {
+                    var vid = kv.Key;
+                    var ta = kv.Value;
+                    Console.WriteLine(
+                        $" - V{vid} -> C{ta.Request.ClientId}  from ({ta.Request.From.X},{ta.Request.From.Y}) to ({ta.Request.To.X},{ta.Request.To.Y})");
+                }
             }
             Console.WriteLine();
 
