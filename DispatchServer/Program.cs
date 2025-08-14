@@ -15,44 +15,46 @@ namespace DispatchServer
 {
     internal class Program
     {
-        // === Konstante i parametri simulacije ===
-        private const int GridSize = 20;                 // 20x20 mapa
-        private const int VehicleTcpPort = 50000;        // TCP (vozila)
-        private const int ClientUdpPort = 50001;         // UDP (klijenti)
-        private const double SpeedStepsPerSec = 0.8;     // brzina: 1 korak / 0.8s (kao u referenci)
+        // TCP (vozila) / UDP (klijenti)
+        private const int VehicleTcpPort = 50000;
+        private const int ClientUdpPort = 50001;
 
-        // === Sockets ===
-        private static Socket _serverTcp; // vehicles
-        private static Socket _serverUdp; // clients
+        // Parametar simulacije 
+        private const double SpeedStepsPerSec = 0.8; // 1 "korak" na ~0.8 sek
 
-        // === Buffers ===
-        private static readonly byte[] _bufVehicle = new byte[1024];
-        private static readonly byte[] _bufClient = new byte[1024];
+        // Sockets
+        private static Socket _serverTcp; // vozila (TCP)
+        private static Socket _serverUdp; // klijenti (UDP)
 
-        // === Evidencija vozila/soketa ===
-        private static readonly List<Socket> _vehicleSockets = new List<Socket>();
-        private static readonly Dictionary<int, TaxiVehicle> _activeVehicles = new Dictionary<int, TaxiVehicle>(); // ID -> vozilo snapshot
-        private static readonly Dictionary<int, Socket> _socketByVehicleId = new Dictionary<int, Socket>();         // ID -> socket
+        // Buffers
+        private static readonly byte[] _bufVehicle = new byte[2048];
+        private static readonly byte[] _bufClient = new byte[2048];
 
-        // === Evidencija zadataka/klijenata (potrebno za mapu i guard) ===
-        private static readonly Dictionary<int, TaskAssignment> _taskByClientId = new Dictionary<int, TaskAssignment>(); // 1 akt. zadatak po klijentu
-        private static readonly Dictionary<int, TaskAssignment> _taskByVehicleId = new Dictionary<int, TaskAssignment>(); // koji zadatak vozi koje vozilo
+        // Evidencije
+        private static readonly List<Socket> _vehicleSockets = new List<Socket>();              // otvorene TCP konekcije
+        private static readonly Dictionary<int, TaxiVehicle> _activeVehicles = new Dictionary<int, TaxiVehicle>(); // id -> stanje vozila
+        private static readonly Dictionary<int, Socket> _socketByVehicleId = new Dictionary<int, Socket>();    // id -> socket
 
-        // === Za “approaching...” obaveštenja (kao u referenci) ===
-        private static readonly Dictionary<int, int> _stepCounterByVehicleId = new Dictionary<int, int>(); // brojac koraka
-        private static readonly Dictionary<int, EndPoint> _clientEpByClientId = new Dictionary<int, EndPoint>(); // UDP EP klijenta
+        // Zadaci/klijenti
+        private static readonly Dictionary<int, TaskAssignment> _taskByVehicleId = new Dictionary<int, TaskAssignment>(); // id vozila -> poslednji zadatak
+        private static readonly HashSet<int> _activeClientIds = new HashSet<int>(); // "jedan aktivan zadatak po klijentu"
+
+        // Obaveštavanje klijenata
+        private static readonly Dictionary<int, int> _stepCounterByVehicleId = new Dictionary<int, int>(); // vozilo -> brojač koraka
+        private static readonly Dictionary<int, EndPoint> _clientEpByClientId = new Dictionary<int, EndPoint>(); // klijent -> njegov UDP EP
+        private static readonly Dictionary<int, int> _clientIdByVehicleId = new Dictionary<int, int>(); // vozilo -> klijent
 
         static void Main(string[] args)
         {
             Console.Title = "DispatchServer";
 
-            // TCP server (vozila)
+            // TCP (vozila)
             _serverTcp = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             _serverTcp.Bind(new IPEndPoint(IPAddress.Any, VehicleTcpPort));
             _serverTcp.Blocking = false;
             _serverTcp.Listen(10);
 
-            // UDP server (klijenti)
+            // UDP (klijenti)
             _serverUdp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
             _serverUdp.Bind(new IPEndPoint(IPAddress.Any, ClientUdpPort));
             _serverUdp.Blocking = false;
@@ -60,7 +62,7 @@ namespace DispatchServer
             Console.WriteLine($"[Server] TCP listening on {VehicleTcpPort} (vehicles)");
             Console.WriteLine($"[Server] UDP bound on {ClientUdpPort} (clients)");
 
-            PrintStatus();
+            PrintStatusAndMap();
 
             while (true)
             {
@@ -77,23 +79,23 @@ namespace DispatchServer
                     {
                         if (sock == _serverTcp)
                         {
-                            // Nova TCP konekcija vozila
+                            // nova TCP konekcija vozila
                             try
                             {
                                 var vehicleSock = _serverTcp.Accept();
                                 vehicleSock.Blocking = false;
                                 _vehicleSockets.Add(vehicleSock);
                                 Console.WriteLine($"[Server] Vehicle connected: {vehicleSock.RemoteEndPoint}");
-                                PrintStatus();
+                                PrintStatusAndMap();
                             }
                             catch (SocketException ex)
                             {
-                                Console.WriteLine($"[Server] Accept error: {ex.Message}");
+                                Console.WriteLine("[Server] Accept error: " + ex.Message);
                             }
                         }
                         else if (sock == _serverUdp)
                         {
-                            // Klijent šalje ClientRequest (UDP, BinaryFormatter)
+                            // klijent šalje zahtev (UDP, BinaryFormatter)
                             try
                             {
                                 EndPoint clientEp = new IPEndPoint(IPAddress.Any, 0);
@@ -110,14 +112,14 @@ namespace DispatchServer
                                 {
                                     Console.WriteLine($"[Server] UDP ClientRequest #{cr.ClientId}: from ({cr.From.X},{cr.From.Y}) to ({cr.To.X},{cr.To.Y})");
 
-                                    // GUARD: jedan aktivan zadatak po klijentu
-                                    if (_taskByClientId.ContainsKey(cr.ClientId))
+                                    // Guard: jedan aktivan zadatak po klijentu
+                                    if (_activeClientIds.Contains(cr.ClientId))
                                     {
                                         SendUdpText("Request denied: you already have an active ride.", clientEp);
                                         continue;
                                     }
 
-                                    // Nađi najbliže "Available" vozilo
+                                    // Nadji najbliže Available vozilo
                                     var best = FindNearestAvailable(_activeVehicles, cr.From);
                                     if (best == null)
                                     {
@@ -125,12 +127,8 @@ namespace DispatchServer
                                         continue;
                                     }
 
-                                    // Formiraj zadatak i pošalji ga izabranom vozilu (TCP)
-                                    var task = new TaskAssignment
-                                    {
-                                        VehicleId = best.Id,
-                                        Request = cr
-                                    };
+                                    // Formiraj TaskAssignment i pošalji vozilu (TCP)
+                                    var ta = new TaskAssignment { VehicleId = best.Id, Request = cr };
 
                                     Socket vSock;
                                     if (_socketByVehicleId.TryGetValue(best.Id, out vSock))
@@ -138,29 +136,32 @@ namespace DispatchServer
                                         using (var ms2 = new MemoryStream())
                                         {
                                             var bf2 = new BinaryFormatter();
-                                            bf2.Serialize(ms2, task);
+                                            bf2.Serialize(ms2, ta);
                                             var payload = ms2.ToArray();
                                             vSock.Send(payload);
                                             Console.WriteLine($"[Server] TaskAssignment sent to vehicle {best.Id} ({payload.Length} bytes) for client {cr.ClientId}");
                                         }
 
-                                        // Sačuvaj evidenciju zadatka i EP klijenta
-                                        _taskByClientId[cr.ClientId] = task;
-                                        _taskByVehicleId[best.Id] = task;
+                                        // upiši evidencije
+                                        _taskByVehicleId[best.Id] = ta;
                                         _clientEpByClientId[cr.ClientId] = clientEp;
+                                        _clientIdByVehicleId[best.Id] = cr.ClientId;
+                                        _activeClientIds.Add(cr.ClientId);
                                         _stepCounterByVehicleId[best.Id] = 0;
 
-                                        // Inicijalni ETA ka klijentu
-                                        int distToClient = Chebyshev(best.Position, cr.From);
-                                        double etaSec = distToClient / SpeedStepsPerSec;
+                                        // ETA (distanca do klijenta / brzina)
+                                        int d2c = Chebyshev(best.Position, cr.From);
+                                        double etaSec = d2c / SpeedStepsPerSec;
                                         SendUdpText($"Vehicle {best.Id} is arriving in approx {etaSec:F1} seconds!", clientEp);
-
-                                        PrintStatus();
+                                    }
+                                    else
+                                    {
+                                        SendUdpText("Temporary error: vehicle socket not found.", clientEp);
                                     }
                                 }
                                 else
                                 {
-                                    // Debug tekstualna poruka (nije ClientRequest)
+                                    // tekstualni UDP debug
                                     var txt = Encoding.UTF8.GetString(_bufClient, 0, read);
                                     Console.WriteLine($"[Server] UDP (text) from {clientEp}: {txt}");
                                     SendUdpText("ACK", clientEp);
@@ -177,7 +178,7 @@ namespace DispatchServer
                         }
                         else
                         {
-                            // Poruka od postojećeg vozila (TCP)
+                            // poruka od povezanog vozila (TCP)
                             try
                             {
                                 int read = sock.Receive(_bufVehicle);
@@ -198,63 +199,71 @@ namespace DispatchServer
 
                                     if (obj is TaxiVehicle tv)
                                     {
-                                        // Ažuriraj stanje vozila + mapiranje soketa
                                         _activeVehicles[tv.Id] = tv;
                                         _socketByVehicleId[tv.Id] = sock;
 
                                         Console.WriteLine($"[Server] Vehicle {tv.Id} @ ({tv.Position.X},{tv.Position.Y}) {tv.Status}");
+                                        PrintStatusAndMap();
 
-                                        // Ako ide ka klijentu → “approaching...” + eventualno “at your location!”
-                                        TaskAssignment ta;
-                                        if (tv.Status == RideStatus.GoingToPickup && _taskByVehicleId.TryGetValue(tv.Id, out ta))
+                                        // "approaching..." logika kad ide po klijenta
+                                        if (tv.Status == RideStatus.GoingToPickup)
                                         {
-                                            // brojač koraka
-                                            if (!_stepCounterByVehicleId.ContainsKey(tv.Id))
-                                                _stepCounterByVehicleId[tv.Id] = 0;
-                                            _stepCounterByVehicleId[tv.Id]++;
-
-                                            int d = Chebyshev(tv.Position, ta.Request.From);
-                                            EndPoint cep;
-                                            if (_clientEpByClientId.TryGetValue(ta.Request.ClientId, out cep))
+                                            int clientId;
+                                            if (_clientIdByVehicleId.TryGetValue(tv.Id, out clientId))
                                             {
-                                                if (_stepCounterByVehicleId[tv.Id] % 4 == 0 && d > 2)
+                                                EndPoint cep;
+                                                if (_clientEpByClientId.TryGetValue(clientId, out cep))
                                                 {
-                                                    double eta = d / SpeedStepsPerSec;
-                                                    SendUdpText($"Vehicle {tv.Id} is approaching... ETA {eta:F1} seconds.", cep);
-                                                }
+                                                    if (!_stepCounterByVehicleId.ContainsKey(tv.Id))
+                                                        _stepCounterByVehicleId[tv.Id] = 0;
 
-                                                if (d == 0) // stigao do klijenta (pre prelaska u InRide)
-                                                {
-                                                    SendUdpText("Your vehicle is at your location!", cep);
+                                                    _stepCounterByVehicleId[tv.Id]++;
+
+                                                    TaskAssignment ta;
+                                                    if (_taskByVehicleId.TryGetValue(tv.Id, out ta) && ta != null)
+                                                    {
+                                                        int d = Chebyshev(tv.Position, ta.Request.From);
+                                                        if (_stepCounterByVehicleId[tv.Id] % 4 == 0 && d > 2)
+                                                        {
+                                                            double eta = d / SpeedStepsPerSec;
+                                                            SendUdpText($"Vehicle {tv.Id} is approaching... ETA {eta:F1} seconds.", cep);
+                                                        }
+
+                                                        // vozilo stiglo do klijenta (pre nego što status pređe u InRide)
+                                                        if (d == 0 && tv.Status != RideStatus.InRide)
+                                                        {
+                                                            SendUdpText("Your vehicle is at your location!", cep);
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
-
-                                        PrintStatus();
                                     }
                                     else if (obj is RideStatusUpdate rs)
                                     {
-                                        // Kraj vožnje – ažuriraj statistiku, obavesti klijenta, očisti evidenciju
-                                        TaxiVehicle vSnap;
-                                        if (_activeVehicles.TryGetValue(rs.VehicleId, out vSnap))
+                                        TaxiVehicle v;
+                                        if (_activeVehicles.TryGetValue(rs.VehicleId, out v))
                                         {
-                                            vSnap.Kilometers += rs.Km;
-                                            vSnap.Earnings += rs.Fare;
-                                            vSnap.PassengersServed++;
+                                            // ažuriraj statistiku
+                                            v.Kilometers += rs.Km;
+                                            v.Earnings += rs.Fare;
+                                            v.PassengersServed++;
 
+                                            // obavesti klijenta o završetku i očisti evidencije
                                             EndPoint cep;
                                             if (_clientEpByClientId.TryGetValue(rs.ClientId, out cep))
                                             {
                                                 SendUdpText($"Arrived at destination! Ride fare: {rs.Fare} RSD.", cep);
                                             }
 
-                                            // očisti task mape
-                                            _taskByVehicleId.Remove(rs.VehicleId);
-                                            _taskByClientId.Remove(rs.ClientId);
+                                            _clientEpByClientId.Remove(rs.ClientId);
                                             _stepCounterByVehicleId.Remove(rs.VehicleId);
+                                            _clientIdByVehicleId.Remove(rs.VehicleId);
+                                            _taskByVehicleId.Remove(rs.VehicleId);
+                                            _activeClientIds.Remove(rs.ClientId);
 
                                             Console.WriteLine($"[Server] Ride finished: vehicle {rs.VehicleId}, client {rs.ClientId}, km={rs.Km}, fare={rs.Fare} RSD");
-                                            PrintStatus();
+                                            PrintStatusAndMap();
                                         }
                                     }
                                     else
@@ -281,36 +290,48 @@ namespace DispatchServer
             }
         }
 
-        // === Pomoćne funkcije ===
-
         private static void HandleVehicleDisconnect(Socket sock)
         {
             Console.WriteLine($"[Server] Vehicle disconnected: {sock.RemoteEndPoint}");
 
+            // nađi ID vozila po socketu
             int removeId = -1;
             foreach (var kv in _socketByVehicleId)
             {
                 if (kv.Value == sock) { removeId = kv.Key; break; }
             }
+
             if (removeId != -1)
             {
-                _socketByVehicleId.Remove(removeId);
-                _activeVehicles.Remove(removeId);
-
-                // ako je vozilo imalo zadatak – očisti i njega (klijent i brojač)
+                // ako je imao aktivan zadatak → javi klijentu “ride canceled”
                 TaskAssignment ta;
-                if (_taskByVehicleId.TryGetValue(removeId, out ta))
+                if (_taskByVehicleId.TryGetValue(removeId, out ta) && ta != null)
                 {
+                    int clientId;
+                    if (_clientIdByVehicleId.TryGetValue(removeId, out clientId))
+                    {
+                        EndPoint cep;
+                        if (_clientEpByClientId.TryGetValue(clientId, out cep))
+                        {
+                            SendUdpText("Sorry, assigned vehicle disconnected. Ride canceled. Please send request again.", cep);
+                        }
+                        _clientEpByClientId.Remove(clientId);
+                        _activeClientIds.Remove(clientId);
+                    }
+
                     _taskByVehicleId.Remove(removeId);
-                    _taskByClientId.Remove(ta.Request.ClientId);
+                    _clientIdByVehicleId.Remove(removeId);
                     _stepCounterByVehicleId.Remove(removeId);
                 }
+
+                _socketByVehicleId.Remove(removeId);
+                _activeVehicles.Remove(removeId);
             }
 
             _vehicleSockets.Remove(sock);
             try { sock.Close(); } catch { }
 
-            PrintStatus();
+            PrintStatusAndMap();
         }
 
         private static void SendUdpText(string text, EndPoint ep)
@@ -321,6 +342,7 @@ namespace DispatchServer
 
         private static int Chebyshev(Coordinate a, Coordinate b)
         {
+            // metrika max(|dx|,|dy|)
             return Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
         }
 
@@ -344,112 +366,74 @@ namespace DispatchServer
             return best;
         }
 
-        // Ispis kompletne slike stanja: zaglavlje, tabela vozila, aktivni zadaci i 20x20 mapa
-        private static void PrintStatus()
+        private static void PrintStatusAndMap()
         {
-            Console.Clear();
-            Console.WriteLine($"[Server] TCP listening on {VehicleTcpPort} (vehicles)");
-            Console.WriteLine($"[Server] UDP bound on {ClientUdpPort} (clients)");
             Console.WriteLine();
             Console.WriteLine("=== TAXI DISPATCH ===");
             Console.WriteLine($"Vehicles connected (sockets): {_vehicleSockets.Count}");
-            Console.WriteLine();
-
-            PrintVehicleTable();
-            PrintActiveTasks();
-            PrintMap();
-
-            Console.WriteLine(); // malo prostora
-        }
-
-        private static void PrintVehicleTable()
-        {
-            Console.WriteLine("ID  Status          Position   Km   Earn     Psg");
-            Console.WriteLine("--  --------------  --------  ----  --------  ---");
             foreach (var v in _activeVehicles.Values.OrderBy(v => v.Id))
             {
-                Console.WriteLine(
-                    $"{v.Id,2}  {v.Status,-14}  ({v.Position.X,2},{v.Position.Y,2})  {v.Kilometers,4}  {v.Earnings,8}  {v.PassengersServed,3}");
+                Console.WriteLine($" - ID {v.Id}: {v.Status} @ ({v.Position.X},{v.Position.Y})  Km={v.Kilometers}  Earn={v.Earnings}  Psg={v.PassengersServed}");
             }
             Console.WriteLine();
-        }
 
-        private static void PrintActiveTasks()
-        {
-            if (_taskByClientId.Count == 0)
-            {
-                Console.WriteLine("Active tasks: none");
-                Console.WriteLine();
-                return;
-            }
-
-            Console.WriteLine("Active tasks:");
-            foreach (var ta in _taskByClientId.Values.OrderBy(t => t.Request.ClientId))
-            {
-                Console.WriteLine($" - Client {ta.Request.ClientId} → Vehicle {ta.VehicleId} : " +
-                                  $"from ({ta.Request.From.X},{ta.Request.From.Y}) to ({ta.Request.To.X},{ta.Request.To.Y})");
-            }
-            Console.WriteLine();
-        }
-
-        private static void PrintMap()
-        {
-            // priprema prazne mape
-            string[,] map = new string[GridSize, GridSize];
-            for (int y = 0; y < GridSize; y++)
-                for (int x = 0; x < GridSize; x++)
+            // ASCII mapa 20×20 (ili iz SimulationConfig)
+            int size = SimulationConfig.GridSize; // očekujemo 20
+            string[,] map = new string[size, size];
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
                     map[x, y] = ".";
 
-            // nacrtaj vozila
+            // prvo upiši vozila
             foreach (var v in _activeVehicles.Values)
             {
-                if (v.Position.X >= 0 && v.Position.X < GridSize &&
-                    v.Position.Y >= 0 && v.Position.Y < GridSize)
+                if (v.Position.X >= 0 && v.Position.X < size && v.Position.Y >= 0 && v.Position.Y < size)
                 {
-                    map[v.Position.X, v.Position.Y] = "V" + v.Id;
+                    map[v.Position.X, v.Position.Y] = "V" + v.Id.ToString();
                 }
             }
 
-            // klijenti / V+K
-            foreach (var ta in _taskByClientId.Values)
+            // zatim upiši klijente / V+K za aktivne zadatke
+            foreach (var kv in _taskByVehicleId)
             {
-                TaxiVehicle vNow;
-                _activeVehicles.TryGetValue(ta.VehicleId, out vNow);
+                int vid = kv.Key;
+                TaskAssignment ta = kv.Value;
+                TaxiVehicle veh;
+                if (_activeVehicles.TryGetValue(vid, out veh))
+                {
+                    bool atClient = veh.Position.X == ta.Request.From.X && veh.Position.Y == ta.Request.From.Y;
+                    bool inRide = veh.Status == RideStatus.InRide;
 
-                if (vNow != null && vNow.Status == RideStatus.InRide)
-                {
-                    // pokaži V+K na poziciji vozila
-                    if (vNow.Position.X >= 0 && vNow.Position.X < GridSize &&
-                        vNow.Position.Y >= 0 && vNow.Position.Y < GridSize)
+                    if (inRide || atClient)
                     {
-                        map[vNow.Position.X, vNow.Position.Y] = "V" + vNow.Id + "+K";
+                        if (veh.Position.X >= 0 && veh.Position.X < size && veh.Position.Y >= 0 && veh.Position.Y < size)
+                        {
+                            map[veh.Position.X, veh.Position.Y] = $"V{veh.Id}+K";
+                        }
                     }
-                }
-                else
-                {
-                    // klijent čeka na startnoj tački
-                    var c = ta.Request.From;
-                    if (c.X >= 0 && c.X < GridSize && c.Y >= 0 && c.Y < GridSize)
+                    else
                     {
-                        // ako već stoji "Vx" na toj ćeliji – prikaži Vx+K
-                        var cur = map[c.X, c.Y];
-                        if (cur.StartsWith("V"))
-                            map[c.X, c.Y] = cur + "+K";
-                        else
-                            map[c.X, c.Y] = "K" + ta.Request.ClientId;
+                        // klijent čeka na From
+                        if (ta.Request.From.X >= 0 && ta.Request.From.X < size && ta.Request.From.Y >= 0 && ta.Request.From.Y < size)
+                        {
+                            map[ta.Request.From.X, ta.Request.From.Y] = "K" + ta.Request.ClientId.ToString();
+                        }
                     }
                 }
             }
 
+            // ispis mape (y redovi, x kolone)
             Console.WriteLine("MAP (20x20):");
-            for (int y = 0; y < GridSize; y++)
+            for (int y = 0; y < size; y++)
             {
-                for (int x = 0; x < GridSize; x++)
+                var line = new StringBuilder();
+                for (int x = 0; x < size; x++)
                 {
-                    Console.Write($"{map[x, y],-6}");
+                    line.Append(string.Format("{0,-6}", map[x, y]));
                 }
-                Console.WriteLine();
+                Console.WriteLine(line.ToString());
             }
+            Console.WriteLine();
         }
     }
 }
